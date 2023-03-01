@@ -1,0 +1,154 @@
+from chain.name import Name
+from chain.asset import Asset, Symbol
+from chain.contract import Contract
+from chain.database import primary
+from chain.action import require_auth, require_recipient
+from chain.system import check, is_account, has_auth
+
+@table("stat")
+class CurrencyStats:
+    supply: primary[Asset]
+    max_supply: Asset
+    issuer: Name
+
+    def __init__(self, supply: Asset, max_supply: Asset, issuer: Name):
+        self.supply = primary(supply)
+        self.max_supply = max_supply
+        self.issuer = issuer
+
+@table("accounts")
+class Account:
+    balance: primary[Asset]
+
+    def __init__(self, balance: Asset):
+        self.balance = primary[Asset](balance)
+
+@contract(main=True)
+class Token(Contract):
+
+    @action("create")
+    def create(self, issuer: Name, maximum_supply: Asset):
+        require_auth(issuer)
+        check(maximum_supply.is_valid(), "invalid supply")
+        check(maximum_supply.amount > 0, "max_supply must be positive")
+        sym_code = maximum_supply.symbol.code()
+        db = CurrencyStats.new_table(self.receiver, Name(sym_code))
+        it = db.find(sym_code)
+        check(not it.is_ok(),  "token with symbol already exists")
+        stats = CurrencyStats(Asset(0, maximum_supply.symbol), maximum_supply, issuer)
+        db.store(stats, self.receiver)
+
+    @action("issue")
+    def issue(self, to: Name, quantity: Asset, memo: str):
+        check(quantity.is_valid(), "invalid symbol name")
+        check(len(memo) <= 256, "memo has more than 256 bytes")
+        sym_code = quantity.symbol.code()
+        db = CurrencyStats.new_table(self.receiver, Name(sym_code))
+        it = db.find(sym_code)
+        check(it.is_ok(), "token with symbol does not exist, create token before issue")
+        stats: CurrencyStats = it.get_value()
+        check(to == stats.issuer, "tokens can only be issued to issuer account")
+        require_auth(stats.issuer)
+        check(quantity.is_valid(), "invalid quantity")
+        check(quantity.amount > 0, "must issue positive quantity");
+
+        check(quantity.symbol == stats.supply().symbol, "symbol precision mismatch");
+        check(quantity.amount <= stats.max_supply.amount - stats.supply().amount, "quantity exceeds available supply");
+        stats.supply.value += quantity
+        db.update(it, stats, stats.issuer)
+        self.add_balance(to, quantity, to)
+
+    @action("retire")
+    def retire(self, quantity: Asset, memo: str):
+        check(quantity.symbol.is_valid(), "invalid symbol name")
+        check(len(memo) <= 256, "memo has more than 256 bytes")
+        sym_code = quantity.symbol.code()
+        db = CurrencyStats.new_table(self.receiver, Name(sym_code))
+        it = db.find(sym_code)
+        check(it.is_ok(), "token with symbol does not exist")
+        stat = it.get_value()
+        require_auth(stat.issuer)
+        check(quantity.is_valid(), "invalid quantity")
+        check(quantity.amount > 0, "must retire postive quantity")
+        check(quantity.symbol == stat.supply().symbol, "symbol precision mismatch")
+        stat.supply.value -= quantity
+        db.update(it, stat, Name(0u64))
+        self.sub_balance(stat.issuer, quantity)
+
+    @action("transfer")
+    def transfer(self, from_: Name, to: Name, quantity: Asset, memo: str):
+        check(from_ != to, "cannot transfer to self");
+        require_auth(from_)
+        check(is_account(to), "to account does not exist")
+        sym_code = quantity.symbol.code()
+        db = CurrencyStats.new_table(self.receiver, Name(sym_code))
+        it = db.find(sym_code)
+        check(it.is_ok(), "token with symbol does not exist")
+        currency: CurrencyStats = it.get_value()
+        
+        require_recipient(from_)
+        require_recipient(to)
+
+        check(quantity.is_valid(), "invalid quantity");
+        check(quantity.amount > 0, "must transfer positive quantity");
+        check(quantity.symbol == currency.supply().symbol, "symbol precision mismatch");
+        check(len(memo) <= 256, "memo has more than 256 bytes");
+        payer: Name = Name()
+        if has_auth(to):
+            payer = to
+        else:
+            payer = from_
+        self.sub_balance(from_, quantity)
+        self.add_balance(to, quantity, payer)
+
+    @action("open")
+    def open(self, owner: Name, symbol: Symbol, ram_payer: Name):
+        require_auth(ram_payer)
+        check(is_account(owner), "owner account does not exist")
+        db = CurrencyStats.new_table(self.receiver, Name(symbol.code()))
+        it = db.find(symbol.code())
+        check(it.is_ok(), "symbol does not exist")
+        stat: CurrencyStats = it.get_value()
+        check(stat.supply().symbol == symbol, "symbol precision mismatch")
+        
+        accounts = Account.new_table(self.receiver, owner)
+        it_account = accounts.find(symbol.code())
+        if not it_account.is_ok():
+            account = Account(Asset(0, symbol))
+            accounts.store(account, ram_payer)
+ 
+    @action("close")
+    def close(self, owner: Name, symbol: Symbol):
+        require_auth(owner)
+        accounts = Account.new_table(self.receiver, owner)
+        it = accounts.find(symbol.code())
+        check(it.is_ok(), "balance row already deleted or never existed. Action won't have any effect.")
+        value: Account = it.get_value()
+        check(value.balance().amount == 0, "cannot close because the balance is not zero.")
+        accounts.remove(it)
+
+    def add_balance(self, owner: Name, value: Asset, payer: Name):
+        accounts = Account.new_table(self.receiver, owner)
+        it = accounts.find(value.symbol.code())
+        if not it.is_ok():
+            accounts.store(Account(value), payer)
+        else:
+            to: Account = it.get_value()
+            to.balance.value += value
+            accounts.update(it, to, Name(0u64))
+
+    def sub_balance(self, owner: Name, quantity: Asset):
+        accounts = Account.new_table(self.receiver, owner)
+        it = accounts.find(quantity.symbol.code())
+        check(it.is_ok(), "no balance object found")
+        from_: Account = it.get_value()
+        check(from_.balance.value.amount >= quantity.amount, "overdrawn balance")
+        from_.balance.value -= quantity
+        accounts.update(it, from_, owner)
+
+@export
+def apply(receiver: u64, first_receiver: u64, action: u64) -> None:
+    from C import __init_codon__() -> i32
+    __init_codon__()
+    c = Token(receiver, first_receiver, action)
+    c.apply()

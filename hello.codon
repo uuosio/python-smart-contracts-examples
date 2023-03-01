@@ -1,0 +1,19 @@
+from C import memcmp(cobj, cobj, u32) -> i32
+from chain.contract import Contract
+
+@contract(main=True)
+class MyContract(Contract):
+
+    def __init__(self):
+        super().__init__()
+
+    @action('sayhello')
+    def say_hello(self, name: str):
+        print('hello, world', name)
+
+@export
+def apply(receiver: u64, first_receiver: u64, action: u64) -> None:
+    from C import __init_codon__() -> i32
+    __init_codon__()
+    c = MyContract(receiver, first_receiver, action)
+    c.apply()
